@@ -1,0 +1,99 @@
+name: UnvibeCode Watch
+
+# Reviews the base and head of a pull request, then posts one sticky comment
+# describing what the change did to the repository's business workflows and
+# connected code. The comment is updated in place on every push, never duplicated.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # One run per PR; a new push cancels the previous analysis.
+  group: unvibecode-watch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head
+        uses: actions/checkout@v4
+        with:
+          path: head
+          fetch-depth: 0
+
+      - name: Check out base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          fetch-depth: 1
+
+      - name: Check out unvibecode-watch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: watch
+          sparse-checkout: unvibecode-watch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install UnvibeCode
+        run: python -m pip install --upgrade unvibecode
+
+      # The two reviews run sequentially on purpose: concurrent jobs against the
+      # hosted preview service return "Server busy or result not ready".
+      - name: Review base
+        working-directory: base
+        run: python -m unvibecode review --repository . --no-open-browser
+
+      - name: Review head
+        working-directory: head
+        run: python -m unvibecode review --repository . --no-open-browser
+
+      - name: Build the pull-request comment
+        run: |
+          python watch/unvibecode-watch/unvibecode_watch.py diff \
+            base/unvibecode_results \
+            head/unvibecode_results \
+            --out comment.md
+          cat comment.md
+
+      - name: Post or update the sticky comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            const marker = '<!-- unvibecode-watch -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number }
+            );
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            const payload = `${marker}\n${body}`;
+
+            if (mine) {
+              await github.rest.issues.updateComment(
+                { owner, repo, comment_id: mine.id, body: payload }
+              );
+            } else {
+              await github.rest.issues.createComment(
+                { owner, repo, issue_number, body: payload }
+              );
+            }
+
+      # Optional gate. Fails the check when the head review did not produce every
+      # deliverable, so a silently partial analysis cannot be mistaken for a clean one.
+      - name: Fail if analysis coverage was incomplete
+        if: ${{ vars.UNVIBECODE_WATCH_STRICT == 'true' }}
+        run: python watch/unvibecode-watch/unvibecode_watch.py check head/unvibecode_results
